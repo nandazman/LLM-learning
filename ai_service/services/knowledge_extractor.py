@@ -4,11 +4,12 @@ from typing import Dict, List, Optional
 import json
 from llm.router import LLMRouter
 from data.neo4j_connector import neo4j_connector
-from data.vector_store import vector_db
+from data.vector_qdrant import qdrant_db
 import logging
 import time
 from datetime import datetime
 import re
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -751,7 +752,7 @@ Timestamp: {metric['timestamp']}
             # Store in vector DB with chunked content
             chunks = self._chunk_vector_text(data, source_url)
             for chunk in chunks:
-                await vector_db.add_document(
+                await qdrant_db.add_document(
                     chunk["text"],
                     metadata={
                         **chunk["metadata"],
@@ -976,10 +977,10 @@ Timestamp: {metric['timestamp']}
         """Search for similar concepts using semantic similarity."""
         try:
             # Get vector representation of the query
-            query_vector = await vector_db.get_embedding(query)
+            query_vector = await qdrant_db.get_embedding(query)
             
             # Search in vector store with threshold
-            results = await vector_db.search(
+            results = await qdrant_db.search(
                 query_vector,
                 threshold=threshold,
                 limit=limit,

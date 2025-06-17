@@ -5,11 +5,17 @@ from pydantic import BaseModel, HttpUrl
 from typing import List, Dict, Any, Optional
 from services.knowledge_extractor import KnowledgeExtractor
 from data.neo4j_connector import neo4j_connector
-from data.vector_store import vector_db
+from data.vector_qdrant import qdrant_db
 from data.schema import initialize_schema, validate_node_properties
-from services.rag_service import rag_service
+import logging
+
 import time
 import json
+import os
+
+# Configure logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
     title="AI Forum Assistant",
@@ -29,6 +35,9 @@ app.add_middleware(
 # Initialize services
 llm_router = LLMRouter()
 knowledge_extractor = KnowledgeExtractor(llm_router)
+
+# Use Qdrant as the vector store
+active_vector_store = qdrant_db
 
 # Initialize schema on startup
 @app.on_event("startup")
@@ -206,82 +215,6 @@ async def extract_knowledge(url: str):
         else:
             raise HTTPException(status_code=500, detail=error_msg)
 
-@app.get("/knowledge/search")
-async def search_knowledge(query: str = None, limit: int = 10):
-    """
-    Search knowledge using both vector and graph search.
-    If query is provided, performs semantic search.
-    If no query, returns recent knowledge entries.
-    """
-    try:
-        if query:
-            # Use RAG service for semantic search
-            result = await rag_service.process_question(query)
-            
-            # Format the results
-            knowledge_entries = []
-            for source in result["sources"]:
-                # Get detailed node information from Neo4j
-                cypher = '''
-                MATCH (n)
-                WHERE n.id = $node_id
-                OPTIONAL MATCH (n)-[r]-(related)
-                RETURN n, collect(distinct {node: related, rel: type(r)}) as related_nodes
-                '''
-                node_data = neo4j_connector.execute_query(cypher, {"node_id": source["id"]})
-                
-                if node_data:
-                    entry = {
-                        "node": dict(node_data[0]["n"]),
-                        "related_nodes": [
-                            {"node": dict(rel["node"]), "relationship": rel["rel"]}
-                            for rel in node_data[0]["related_nodes"]
-                            if rel["node"]
-                        ],
-                        "relevance": source["relevance"]
-                    }
-                    knowledge_entries.append(entry)
-            
-            return {
-                "status": "success",
-                "data": knowledge_entries,
-                "search_type": "semantic",
-                "confidence": result["confidence"]
-            }
-        else:
-            # Return recent entries
-            cypher = '''
-            MATCH (n:Concept)
-            OPTIONAL MATCH (n)-[r]-(related)
-            RETURN n, collect(distinct {node: related, rel: type(r)}) as related_nodes
-            ORDER BY n.created_at DESC
-            LIMIT $limit
-            '''
-            results = neo4j_connector.execute_query(cypher, {"limit": limit})
-            
-            knowledge_entries = []
-            for result in results:
-                entry = {
-                    "node": dict(result["n"]),
-                    "related_nodes": [
-                        {"node": dict(rel["node"]), "relationship": rel["rel"]}
-                        for rel in result["related_nodes"]
-                        if rel["node"]
-                    ]
-                }
-                knowledge_entries.append(entry)
-            
-            return {
-                "status": "success",
-                "data": knowledge_entries,
-                "search_type": "recent"
-            }
-            
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving knowledge: {str(e)}"
-        )
 
 @app.post("/knowledge")
 async def store_knowledge(knowledge_data: KnowledgeData, url: Optional[str] = None):
@@ -391,7 +324,7 @@ async def generate(request: Request):
 def clear_vector_db():
     """Clear all documents from the vector DB collection. For admin/testing use only."""
     try:
-        vector_db.clear_collection()
+        active_vector_store.clear_collection()
         return {"status": "success", "message": "Vector DB cleared."}
     except Exception as e:
         return {"status": "error", "message": str(e)}

@@ -1,13 +1,12 @@
 from typing import Optional, List, Dict, Any
 import httpx
 import json
-import asyncio
-from tenacity import retry, stop_after_attempt, wait_exponential
+
 from pydantic import BaseModel
 import traceback
-from data.vector_store import vector_db
 from data.neo4j_connector import neo4j_connector
-from data.schema import validate_node_properties, validate_relationship
+from data.schema import validate_relationship
+import os
 
 class LLMResponse(BaseModel):
     text: str
@@ -23,7 +22,6 @@ class LLMRouter:
         """
         self.client = httpx.AsyncClient(base_url=f"http://{ollama_host}:11434", timeout=240.0)
         self.default_model = "gemma:2b"
-        self.vector_db = vector_db
         self.neo4j = neo4j_connector
         
     async def generate_response(
@@ -100,7 +98,7 @@ class LLMRouter:
     async def close(self):
         await self.client.aclose()
 
-    async def process_question(self, question: str) -> Dict[str, Any]:
+    async def process_question(self, question: str, active_vector_store=None) -> Dict[str, Any]:
         """
         Process a question through the RAG pipeline.
         
@@ -123,7 +121,7 @@ class LLMRouter:
             #     },
             #     ...
             # ]
-            hits = await self.vector_db.similarity_search(question, k=8)
+            hits = await active_vector_store.similarity_search(question, k=8)
             
             # Step 2: Build Cypher query
             # This step constructs a Cypher query based on the node IDs and types from the vector search results.

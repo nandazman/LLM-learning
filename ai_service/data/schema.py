@@ -38,7 +38,13 @@ def initialize_schema():
         # Create constraints
         for constraint in SCHEMA["constraints_and_indexes"]:
             if constraint.startswith("UNIQUE"):
-                neo4j_connector.execute_query(f"CREATE CONSTRAINT IF NOT EXISTS {constraint}")
+                # Extract the label and property from the old format
+                parts = constraint.split()
+                label = parts[1].strip(":")
+                prop = parts[2].strip("()")
+                # Create using new syntax
+                query = f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.{prop} IS UNIQUE"
+                neo4j_connector.execute_query(query)
             elif constraint.startswith("FULLTEXT"):
                 # Extract labels from FULLTEXT index
                 labels = constraint.split("[")[1].split("]")[0].split(", ")
