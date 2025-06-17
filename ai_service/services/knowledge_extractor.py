@@ -5,12 +5,113 @@ import json
 from llm.router import LLMRouter
 from data.neo4j_connector import neo4j_connector
 from data.vector_store import vector_db
+import logging
+import time
+from datetime import datetime
+import re
+
+logger = logging.getLogger(__name__)
 
 class KnowledgeExtractor:
     def __init__(self, llm_router: LLMRouter, store_in_neo4j: bool = True):
         self.llm_router = llm_router
         self.client = httpx.AsyncClient()
         self.store_in_neo4j = store_in_neo4j
+
+    async def extract_from_text(self, text: str, title: str, content_type: Optional[str] = None, url: Optional[str] = None) -> Dict:
+        """Extract knowledge directly from text input"""
+        try:
+            # If content type is not provided, detect it
+            if not content_type:
+                content_type = await self._detect_content_type(text)
+            logger.info(f"Content type detected: {content_type}")
+
+            # Extract knowledge based on content type
+            if content_type == "procedural":
+                structured_data = await self._extract_procedural_knowledge(text, title)
+            elif content_type == "informational":
+                structured_data = await self._extract_informational_knowledge(text, title)
+            else:  # mixed
+                structured_data = await self._extract_mixed_knowledge(text, title)
+
+            # Transform the data to match our schema
+            transformed_data = {
+                "concept": {
+                    "id": f"concept_{int(time.time())}",
+                    "name": structured_data.get("concept", {}).get("name", title),
+                    "description": structured_data.get("concept", {}).get("description", "")
+                },
+                "procedures": [
+                    {
+                        "id": procedure.get("id", f"procedure_{int(time.time())}_{i}"),
+                        "title": procedure.get("title", ""),
+                        "summary": procedure.get("summary", ""),
+                        "steps": [
+                            {
+                                "id": step.get("id", f"step_{int(time.time())}_{i}_{j}"),
+                                "order": step.get("order", j + 1),
+                                "text": step.get("text", "")
+                            }
+                            for j, step in enumerate(procedure.get("steps", []))
+                        ]
+                    }
+                    for i, procedure in enumerate(structured_data.get("procedures", []))
+                ],
+                "metrics": [
+                    {
+                        "id": metric.get("id", f"metric_{int(time.time())}_{i}"),
+                        "name": metric.get("name", ""),
+                        "value": metric.get("value", ""),
+                        "unit": metric.get("unit", ""),
+                        "timestamp": metric.get("timestamp", datetime.now().strftime("%Y-%m-%d"))
+                    }
+                    for i, metric in enumerate(structured_data.get("metrics", []))
+                ],
+                "sources": [
+                    {
+                        "id": source.get("id", f"source_{int(time.time())}_{i}"),
+                        "url": source.get("url", ""),
+                        "title": source.get("title", ""),
+                        "published_at": source.get("published_at", datetime.now().strftime("%Y-%m-%d"))
+                    }
+                    for i, source in enumerate(structured_data.get("sources", []))
+                ],
+                "tags": [
+                    {
+                        "id": tag.get("id", f"tag_{int(time.time())}_{i}"),
+                        "name": tag.get("name", "")
+                    }
+                    for i, tag in enumerate(structured_data.get("tags", []))
+                ],
+                "related_concepts": [
+                    {
+                        "id": concept.get("id", f"concept_{int(time.time())}_{i}"),
+                        "name": concept.get("name", ""),
+                        "description": concept.get("description", "")
+                    }
+                    for i, concept in enumerate(structured_data.get("related_concepts", []))
+                ]
+            }
+
+            # Add source URL if provided
+            if url:
+                transformed_data["sources"].append({
+                    "id": f"source_{int(time.time())}",
+                    "url": url,
+                    "title": title,
+                    "published_at": datetime.now().strftime("%Y-%m-%d")
+                })
+
+            if self.store_in_neo4j:
+                logger.info("Storing structured data in Neo4j...")
+                await self._store_in_neo4j(transformed_data, url)
+                logger.info("Data stored in Neo4j successfully.")
+
+            return transformed_data
+
+        except Exception as e:
+            logger.error(f"Error extracting knowledge: {str(e)}")
+            raise
 
     async def extract_from_url(self, url: str) -> Dict:
         """Extract knowledge from a given URL"""
@@ -39,24 +140,8 @@ class KnowledgeExtractor:
             content = "\n".join(content_elements)
             print(f"[DEBUG] Extracted content length: {len(content)}")
 
-            # First, detect the type of content
-            content_type = await self._detect_content_type(content)
-            print(f"[DEBUG] Detected content type: {content_type}")
-
-            # Then extract knowledge based on content type
-            if content_type == "procedural":
-                structured_data = await self._extract_procedural_knowledge(content, title_text)
-            elif content_type == "informational":
-                structured_data = await self._extract_informational_knowledge(content, title_text)
-            else:  # mixed
-                structured_data = await self._extract_mixed_knowledge(content, title_text)
-
-            if self.store_in_neo4j:
-                print(f"[DEBUG] Storing structured data in Neo4j...")
-                await self._store_in_neo4j(structured_data, url)
-                print(f"[DEBUG] Data stored in Neo4j successfully.")
-
-            return structured_data
+            # Use the new extract_from_text method
+            return await self.extract_from_text(content, title_text)
 
         except Exception as e:
             print(f"[ERROR] Error extracting knowledge: {str(e)}")
@@ -78,375 +163,858 @@ class KnowledgeExtractor:
         response = await self.llm_router.generate_response(prompt)
         return response.strip().lower()
 
-    async def _extract_procedural_knowledge(self, content: str, title: str) -> Dict:
-        """Extract procedural knowledge from the article using the new, detailed prompt."""
-        prompt = f"""
-You are an expert at extracting structured knowledge for graph databases.
-
-Your task is to extract procedural knowledge from the following article:
-
-Title: {title}
-
-Content:
-{content}
-
-Return a JSON object with the following structure (all fields must be filled as accurately as possible, in Bahasa Indonesia):
-
-{{
-  "title": "{title}",
-  "content_type": "procedural",          // "procedural", "informational", or "mixed"
-  "topic": ["string"],               // Pilih dari: ["Jual Properti", "Beli Properti", "Sewa Properti", "Agen Properti", "KPR", "Iklan di Rumah123", "Hukum Properti", "Tips & Lainnya", "Take Over KPR"]
-  "summary": "string",               // Ringkasan singkat dari artikel
-  "keywords": ["string"],           // Kata kunci penting dari seluruh artikel
-
-  "procedural_parts": [
-    {{
-      "step": "string",             // Langkah dalam proses
-      "description": "string",      // Penjelasan langkah
-      "requirements": ["string"],   // Persyaratan / dokumen / alat yang dibutuhkan
-      "warnings": ["string"],       // Peringatan atau risiko di langkah ini
-      "tips": ["string"],           // Saran untuk menjalankan langkah ini lebih baik
-      "keywords": ["string"]        // Kata kunci khusus untuk langkah ini
-    }}
-  ],
-
-  "informational_parts": [
-    {{
-      "concept": "string",          // Istilah atau konsep yang dijelaskan
-      "definition": "string",       // Penjelasan konsep tersebut
-      "importance": "high/medium/low", // Seberapa penting informasi ini
-      "keywords": ["string"]        // Kata kunci relevan dengan konsep ini
-    }}
-  ],
-
-  "key_facts": ["string"],         // Fakta penting dan mudah diingat
-  "warnings": ["string"],          // Peringatan umum dari artikel
-  "tips": ["string"],              // Tips umum dari artikel
-
-  "metadata": {{
-    "language": "id",              // Bahasa konten
-    "domain": "string",            // Contoh: "properti", "hukum", "keuangan"
-    "difficulty": "beginner/intermediate/advanced", // Tingkat pemahaman yang diperlukan
-    "prerequisites": ["string"]    // Pengetahuan dasar yang diperlukan
-  }}
-}}
-
-Only return the JSON. Don't include explanations or additional commentary.
-"""
-        return json.loads(await self.llm_router.generate_response(prompt))
-
-    async def _extract_informational_knowledge(self, content: str, title: str) -> Dict:
-        """Extract informational knowledge from the article using the new, detailed prompt."""
-        prompt = f"""
-You are an expert at extracting structured knowledge for graph databases.
-
-Your task is to extract informational knowledge from the following article:
-
-Title: {title}
-
-Content:
-{content}
-
-Return a JSON object with the following structure (all fields must be filled as accurately as possible, in Bahasa Indonesia):
-
-{{
-  "title": "{title}",
-  "content_type": "informational",          // "procedural", "informational", or "mixed"
-  "topic": ["string"],               // Pilih dari: ["Jual Properti", "Beli Properti", "Sewa Properti", "Agen Properti", "KPR", "Iklan di Rumah123", "Hukum Properti", "Tips & Lainnya", "Take Over KPR"]
-  "summary": "string",               // Ringkasan singkat dari artikel
-  "keywords": ["string"],           // Kata kunci penting dari seluruh artikel
-
-  "procedural_parts": [
-    {{
-      "step": "string",             // Langkah dalam proses
-      "description": "string",      // Penjelasan langkah
-      "requirements": ["string"],   // Persyaratan / dokumen / alat yang dibutuhkan
-      "warnings": ["string"],       // Peringatan atau risiko di langkah ini
-      "tips": ["string"],           // Saran untuk menjalankan langkah ini lebih baik
-      "keywords": ["string"]        // Kata kunci khusus untuk langkah ini
-    }}
-  ],
-
-  "informational_parts": [
-    {{
-      "concept": "string",          // Istilah atau konsep yang dijelaskan
-      "definition": "string",       // Penjelasan konsep tersebut
-      "importance": "high/medium/low", // Seberapa penting informasi ini
-      "keywords": ["string"]        // Kata kunci relevan dengan konsep ini
-    }}
-  ],
-
-  "key_facts": ["string"],         // Fakta penting dan mudah diingat
-  "warnings": ["string"],          // Peringatan umum dari artikel
-  "tips": ["string"],              // Tips umum dari artikel
-
-  "metadata": {{
-    "language": "id",              // Bahasa konten
-    "domain": "string",            // Contoh: "properti", "hukum", "keuangan"
-    "difficulty": "beginner/intermediate/advanced", // Tingkat pemahaman yang diperlukan
-    "prerequisites": ["string"]    // Pengetahuan dasar yang diperlukan
-  }}
-}}
-
-Only return the JSON. Don't include explanations or additional commentary.
-"""
-        return json.loads(await self.llm_router.generate_response(prompt))
-
-    async def _extract_mixed_knowledge(self, content: str, title: str) -> Dict:
-        """Extract both procedural and informational knowledge from the article using the new, detailed prompt."""
-        prompt = f"""
-You are an expert at extracting structured knowledge for graph databases.
-
-Your task is to extract both procedural and informational knowledge from the following article:
-
-Title: {title}
-
-Content:
-{content}
-
-Return a JSON object with the following structure (all fields must be filled as accurately as possible, in Bahasa Indonesia):
-
-{{
-  "title": "{title}",
-  "content_type": "string",          // "procedural", "informational", or "mixed"
-  "topic": ["string"],               // Pilih dari: ["Jual Properti", "Beli Properti", "Sewa Properti", "Agen Properti", "KPR", "Iklan di Rumah123", "Hukum Properti", "Tips & Lainnya", "Take Over KPR"]
-  "summary": "string",               // Ringkasan singkat dari artikel
-  "keywords": ["string"],           // Kata kunci penting dari seluruh artikel
-
-  "procedural_parts": [
-    {{
-      "step": "string",             // Langkah dalam proses
-      "description": "string",      // Penjelasan langkah
-      "requirements": ["string"],   // Persyaratan / dokumen / alat yang dibutuhkan
-      "warnings": ["string"],       // Peringatan atau risiko di langkah ini
-      "tips": ["string"],           // Saran untuk menjalankan langkah ini lebih baik
-      "keywords": ["string"]        // Kata kunci khusus untuk langkah ini
-    }}
-  ],
-
-  "informational_parts": [
-    {{
-      "concept": "string",          // Istilah atau konsep yang dijelaskan
-      "definition": "string",       // Penjelasan konsep tersebut
-      "importance": "high/medium/low", // Seberapa penting informasi ini
-      "keywords": ["string"]        // Kata kunci relevan dengan konsep ini
-    }}
-  ],
-
-  "key_facts": ["string"],         // Fakta penting dan mudah diingat
-  "warnings": ["string"],          // Peringatan umum dari artikel
-  "tips": ["string"],              // Tips umum dari artikel
-
-  "metadata": {{
-    "language": "id",              // Bahasa konten
-    "domain": "string",            // Contoh: "properti", "hukum", "keuangan"
-    "difficulty": "beginner/intermediate/advanced", // Tingkat pemahaman yang diperlukan
-    "prerequisites": ["string"]    // Pengetahuan dasar yang diperlukan
-  }}
-}}
-
-Only return the JSON. Don't include explanations or additional commentary.
-"""
-        return json.loads(await self.llm_router.generate_response(prompt))
-
-    async def _store_in_neo4j(self, data: Dict, source_url: str):
-        """Store the extracted knowledge in Neo4j and vector DB"""
+    async def _extract_procedural_knowledge(self, text: str, title: str) -> Dict:
+        """Extract procedural knowledge from text"""
         try:
-            # Normalize helper
-            def normalize_list(lst):
-                return [str(x).strip().lower() for x in lst]
-            def normalize_str(s):
-                return str(s).strip().lower() if s else s
+            prompt = f"""Extract procedural knowledge from the following text. 
+            Format the response as a JSON object with these exact fields:
+            {{
+                "concept": {{
+                    "id": "concept_[timestamp]",
+                    "name": "Main concept or topic name",
+                    "description": "Brief summary of the concept"
+                }},
+                "procedures": [
+                    {{
+                        "id": "procedure_[timestamp]_[index]",
+                        "title": "Step title or name",
+                        "summary": "Detailed description of the step",
+                        "steps": [
+                            {{
+                                "id": "step_[timestamp]_[index]",
+                                "order": [step_number],
+                                "text": "Detailed step description"
+                            }}
+                        ]
+                    }}
+                ],
+                "metrics": [
+                    {{
+                        "id": "metric_[timestamp]_[index]",
+                        "name": "Metric name",
+                        "value": "Metric value",
+                        "unit": "Unit of measurement",
+                        "timestamp": "YYYY-MM-DD"
+                    }}
+                ],
+                "sources": [
+                    {{
+                        "id": "source_[timestamp]_[index]",
+                        "url": "Source URL",
+                        "title": "Source title",
+                        "published_at": "YYYY-MM-DD"
+                    }}
+                ],
+                "tags": [
+                    {{
+                        "id": "tag_[timestamp]_[index]",
+                        "name": "Tag name"
+                    }}
+                ],
+                "related_concepts": [
+                    {{
+                        "id": "concept_[timestamp]_[index]",
+                        "name": "Related concept name",
+                        "description": "Related concept description"
+                    }}
+                ]
+            }}
 
-            article_props = {
-                "title": normalize_str(data["title"]),
-                "url": source_url,
-                "type": data["content_type"],
-                "topic": normalize_list(data["topic"]),
-                "summary": data.get("summary", ""),
-                "keywords": normalize_list(data.get("keywords", [])),
-                "language": data.get("metadata", {}).get("language", "id"),
-                "domain": normalize_str(data.get("metadata", {}).get("domain", "")),
-                "difficulty": data.get("metadata", {}).get("difficulty", "intermediate"),
-                "prerequisites": data.get("metadata", {}).get("prerequisites", []),
-                "node_type": "Article"
-            }
-            article_node = neo4j_connector.create_node("Article", article_props)
-            
-            # Store in vector DB
-            article_text = f"""Title: {data['title']}\nType: {data['content_type']}\nTopics: {', '.join(data['topic'])}\nSummary: {data.get('summary', '')}\nKeywords: {', '.join(data.get('keywords', []))}\nDomain: {data.get('metadata', {}).get('domain', '')}\nDifficulty: {data.get('metadata', {}).get('difficulty', 'intermediate')}\n"""
-            # Only Article, Concept, and Procedure nodes are added to the vector DB for semantic search.
-            # Facts, Warnings, Tips, Topics, Keywords, and Prerequisites are NOT embedded or indexed in the vector DB.
-            await vector_db.add_document(
-                text=article_text,
-                metadata=article_props,
-                node_id=article_node["n"].id
-            )
+            Text to analyze:
+            {text}
 
-            # Store keywords as nodes and relationships for Article
-            for keyword in article_props["keywords"]:
-                keyword_props = {"name": keyword, "node_type": "Keyword"}
-                keyword_node = neo4j_connector.create_node("Keyword", keyword_props)
-                neo4j_connector.create_relationship(
-                    "Article",
-                    "Keyword",
-                    "HAS_KEYWORD",
-                    article_props,
-                    keyword_props,
-                    {}
-                )
-            # Store prerequisites as nodes and relationships for Article
-            for prereq in article_props["prerequisites"]:
-                prereq_props = {"name": prereq, "node_type": "Prerequisite"}
-                prereq_node = neo4j_connector.create_node("Prerequisite", prereq_props)
-                neo4j_connector.create_relationship(
-                    "Article",
-                    "Prerequisite",
-                    "HAS_PREREQUISITE",
-                    article_props,
-                    prereq_props,
-                    {}
-                )
+            Respond with ONLY the JSON object, no additional text."""
 
-            # Store concepts from informational_parts
-            for info in data.get("informational_parts", []):
-                concept_props = {
-                    "name": normalize_str(info["concept"]),
-                    "definition": info.get("definition", ""),
-                    "importance": info.get("importance", "medium"),
-                    "keywords": normalize_list(info.get("keywords", [])),
-                    "node_type": "Concept"
-                }
-                concept_node = neo4j_connector.create_node("Concept", concept_props)
-                # Store keywords for Concept
-                for keyword in concept_props["keywords"]:
-                    keyword_props = {"name": keyword, "node_type": "Keyword"}
-                    keyword_node = neo4j_connector.create_node("Keyword", keyword_props)
-                    neo4j_connector.create_relationship(
-                        "Concept",
-                        "Keyword",
-                        "HAS_KEYWORD",
-                        concept_props,
-                        keyword_props,
-                        {}
-                    )
-                neo4j_connector.create_relationship(
-                    "Article",
-                    "Concept",
-                    "DISCUSSES",
-                    article_props,
-                    concept_props,
-                    {}
-                )
-
-            # Store procedures from procedural_parts
-            previous_proc_props = None  # Keep track of previous procedure
-
-            for procedure in data.get("procedural_parts", []):
-                proc_props = {
-                    "step": procedure["step"],
-                    "description": procedure["description"],
-                    "requirements": procedure.get("requirements", []),
-                    "warnings": procedure.get("warnings", []),
-                    "tips": procedure.get("tips", []),
-                    "keywords": normalize_list(procedure.get("keywords", [])),
-                    "node_type": "Procedure"
-                }
-
-                proc_node = neo4j_connector.create_node("Procedure", proc_props)
-
-                # Link to keywords
-                for keyword in proc_props["keywords"]:
-                    keyword_props = {"name": keyword, "node_type": "Keyword"}
-                    keyword_node = neo4j_connector.create_node("Keyword", keyword_props)
-                    neo4j_connector.create_relationship(
-                        "Procedure", "Keyword", "HAS_KEYWORD", proc_props, keyword_props, {}
-                    )
-
-                # Link to prerequisites
-                for prereq in proc_props.get("requirements", []):
-                    prereq_props = {"name": prereq, "node_type": "Prerequisite"}
-                    prereq_node = neo4j_connector.create_node("Prerequisite", prereq_props)
-                    neo4j_connector.create_relationship(
-                        "Procedure", "Prerequisite", "HAS_PREREQUISITE", proc_props, prereq_props, {}
-                    )
-
-                # Link to Article
-                neo4j_connector.create_relationship(
-                    "Article", "Procedure", "CONTAINS_PROCEDURE", article_props, proc_props, {}
-                )
-
-                # 🔗 Link to previous step using :NEXT
-                if previous_proc_props:
-                    neo4j_connector.create_relationship(
-                        "Procedure", "Procedure", "NEXT", previous_proc_props, proc_props, {}
-                    )
-
-                previous_proc_props = proc_props
-
-
-            # Store facts
-            for fact in data.get("key_facts", []):
-                fact_props = {
-                    "text": fact,
-                    "source": source_url,
-                    "node_type": "Fact"
-                }
-                fact_node = neo4j_connector.create_node("Fact", fact_props)
-                neo4j_connector.create_relationship(
-                    "Article",
-                    "Fact",
-                    "CONTAINS_FACT",
-                    article_props,
-                    fact_props,
-                    {}
-                )
-
-            # Store warnings
-            for warning in data.get("warnings", []):
-                warning_props = {
-                    "text": warning,
-                    "node_type": "Warning"
-                }
-                warning_node = neo4j_connector.create_node("Warning", warning_props)
-                neo4j_connector.create_relationship(
-                    "Article",
-                    "Warning",
-                    "HAS_WARNING",
-                    article_props,
-                    warning_props,
-                    {}
-                )
-
-            # Store tips
-            for tip in data.get("tips", []):
-                tip_props = {
-                    "text": tip,
-                    "node_type": "Tip"
-                }
-                tip_node = neo4j_connector.create_node("Tip", tip_props)
-                neo4j_connector.create_relationship(
-                    "Article",
-                    "Tip",
-                    "HAS_TIP",
-                    article_props,
-                    tip_props,
-                    {}
-                )
-
-            # Store topics
-            for topic in data.get("topic", []):
-                topic_props = {"name": normalize_str(topic), "node_type": "Topic"}
-                topic_node = neo4j_connector.create_node("Topic", topic_props)
-                neo4j_connector.create_relationship(
-                    "Article",
-                    "Topic",
-                    "HAS_TOPIC",
-                    article_props,
-                    topic_props,
-                    {}
-                )
+            response = await self.llm_router.generate_response(prompt)
+            return self._parse_llm_response(response)
 
         except Exception as e:
-            print(f"[ERROR] Error storing in Neo4j: {str(e)}")
+            logger.error(f"Error extracting procedural knowledge: {str(e)}")
+            raise
+
+    async def _extract_informational_knowledge(self, text: str, title: str) -> Dict:
+        """Extract informational knowledge from text"""
+        try:
+            prompt = f"""Extract informational knowledge from the following text. 
+            Format the response as a JSON object with these exact fields:
+            {{
+                "concept": {{
+                    "id": "concept_[timestamp]",
+                    "name": "Main concept or topic name",
+                    "description": "Brief summary of the concept"
+                }},
+                "procedures": [
+                    {{
+                        "id": "procedure_[timestamp]_[index]",
+                        "title": "Step title or name",
+                        "summary": "Detailed description of the step",
+                        "steps": [
+                            {{
+                                "id": "step_[timestamp]_[index]",
+                                "order": [step_number],
+                                "text": "Detailed step description"
+                            }}
+                        ]
+                    }}
+                ],
+                "metrics": [
+                    {{
+                        "id": "metric_[timestamp]_[index]",
+                        "name": "Metric name",
+                        "value": "Metric value",
+                        "unit": "Unit of measurement",
+                        "timestamp": "YYYY-MM-DD"
+                    }}
+                ],
+                "sources": [
+                    {{
+                        "id": "source_[timestamp]_[index]",
+                        "url": "Source URL",
+                        "title": "Source title",
+                        "published_at": "YYYY-MM-DD"
+                    }}
+                ],
+                "tags": [
+                    {{
+                        "id": "tag_[timestamp]_[index]",
+                        "name": "Tag name"
+                    }}
+                ],
+                "related_concepts": [
+                    {{
+                        "id": "concept_[timestamp]_[index]",
+                        "name": "Related concept name",
+                        "description": "Related concept description"
+                    }}
+                ]
+            }}
+
+            Text to analyze:
+            {text}
+
+            Respond with ONLY the JSON object, no additional text."""
+
+            response = await self.llm_router.generate_response(prompt)
+            return self._parse_llm_response(response)
+
+        except Exception as e:
+            logger.error(f"Error extracting informational knowledge: {str(e)}")
+            raise
+
+    async def _extract_mixed_knowledge(self, text: str, title: str) -> Dict:
+        """Extract mixed knowledge from text"""
+        try:
+            prompt = f"""Extract both procedural and informational knowledge from the following text. 
+            Format the response as a JSON object with these exact fields:
+            {{
+                "concept": {{
+                    "id": "concept_[timestamp]",
+                    "name": "Main concept or topic name",
+                    "description": "Brief summary of the concept"
+                }},
+                "procedures": [
+                    {{
+                        "id": "procedure_[timestamp]_[index]",
+                        "title": "Step title or name",
+                        "summary": "Detailed description of the step",
+                        "steps": [
+                            {{
+                                "id": "step_[timestamp]_[index]",
+                                "order": [step_number],
+                                "text": "Detailed step description"
+                            }}
+                        ]
+                    }}
+                ],
+                "metrics": [
+                    {{
+                        "id": "metric_[timestamp]_[index]",
+                        "name": "Metric name",
+                        "value": "Metric value",
+                        "unit": "Unit of measurement",
+                        "timestamp": "YYYY-MM-DD"
+                    }}
+                ],
+                "sources": [
+                    {{
+                        "id": "source_[timestamp]_[index]",
+                        "url": "Source URL",
+                        "title": "Source title",
+                        "published_at": "YYYY-MM-DD"
+                    }}
+                ],
+                "tags": [
+                    {{
+                        "id": "tag_[timestamp]_[index]",
+                        "name": "Tag name"
+                    }}
+                ],
+                "related_concepts": [
+                    {{
+                        "id": "concept_[timestamp]_[index]",
+                        "name": "Related concept name",
+                        "description": "Related concept description"
+                    }}
+                ]
+            }}
+
+            Text to analyze:
+            {text}
+
+            Respond with ONLY the JSON object, no additional text."""
+
+            response = await self.llm_router.generate_response(prompt)
+            return self._parse_llm_response(response)
+
+        except Exception as e:
+            logger.error(f"Error extracting mixed knowledge: {str(e)}")
+            raise
+
+    def _parse_llm_response(self, response: str) -> Dict:
+        """Parse and validate LLM response"""
+        try:
+            # Extract JSON from response
+            json_str = response.strip()
+            if json_str.startswith("```json"):
+                json_str = json_str[7:]
+            if json_str.endswith("```"):
+                json_str = json_str[:-3]
+            json_str = json_str.strip()
+            
+            data = json.loads(json_str)
+            
+            # Validate required fields
+            required_fields = ["concept", "procedures", "metrics", "sources", "tags", "related_concepts"]
+            for field in required_fields:
+                if field not in data:
+                    data[field] = [] if field != "concept" else {
+                        "id": f"concept_{int(time.time())}",
+                        "name": "",
+                        "description": ""
+                    }
+            
+            # Validate concept fields
+            if not all(field in data["concept"] for field in ["id", "name", "description"]):
+                data["concept"] = {
+                    "id": f"concept_{int(time.time())}",
+                    "name": data["concept"].get("name", ""),
+                    "description": data["concept"].get("description", "")
+                }
+            
+            return data
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse LLM response as JSON: {str(e)}")
+            logger.error(f"Raw response: {response}")
+            raise Exception("Failed to parse knowledge extraction response")
+
+    def _validate_data_quality(self, data: Dict) -> Dict:
+        """Validate and clean data before storage."""
+        validated = data.copy()
+        
+        # Clean and validate concept
+        if "concept" in validated:
+            concept = validated["concept"]
+            concept["name"] = self._clean_text(concept.get("name", ""))
+            concept["description"] = self._clean_text(concept.get("description", ""))
+            # Calculate confidence score based on content quality
+            concept["confidence_score"] = self._calculate_confidence_score(concept)
+        
+        # Clean and validate procedures
+        if "procedures" in validated:
+            for procedure in validated["procedures"]:
+                procedure["title"] = self._clean_text(procedure.get("title", ""))
+                procedure["summary"] = self._clean_text(procedure.get("summary", ""))
+                procedure["confidence_score"] = self._calculate_confidence_score(procedure)
+                
+                # Clean and validate steps
+                if "steps" in procedure:
+                    for step in procedure["steps"]:
+                        step["text"] = self._clean_text(step.get("text", ""))
+                        step["confidence_score"] = self._calculate_confidence_score(step)
+        
+        # Clean and validate metrics
+        if "metrics" in validated:
+            for metric in validated["metrics"]:
+                metric["name"] = self._clean_text(metric.get("name", ""))
+                metric["value"] = self._clean_text(metric.get("value", ""))
+                metric["unit"] = self._clean_text(metric.get("unit", ""))
+                metric["confidence_score"] = self._calculate_confidence_score(metric)
+        
+        # Clean and validate tags
+        if "tags" in validated:
+            for tag in validated["tags"]:
+                tag["name"] = self._clean_text(tag.get("name", ""))
+                tag["confidence_score"] = self._calculate_confidence_score(tag)
+        
+        return validated
+
+    def _clean_text(self, text: str) -> str:
+        """Clean and normalize text content."""
+        if not text:
+            return ""
+        
+        # Remove extra whitespace
+        text = " ".join(text.split())
+        
+        # Remove special characters but keep important ones
+        text = re.sub(r'[^\w\s.,;:!?()-]', '', text)
+        
+        # Normalize quotes and dashes
+        text = text.replace('"', '"').replace('"', '"')
+        text = text.replace('–', '-').replace('—', '-')
+        
+        return text.strip()
+
+    def _calculate_confidence_score(self, data: Dict) -> float:
+        """Calculate confidence score based on data quality."""
+        score = 1.0
+        
+        # Check for empty or very short content
+        for key, value in data.items():
+            if isinstance(value, str):
+                if not value:
+                    score *= 0.8
+                elif len(value) < 10:
+                    score *= 0.9
+        
+        # Check for required fields
+        required_fields = {
+            "concept": ["name", "description"],
+            "procedure": ["title", "summary"],
+            "step": ["text"],
+            "metric": ["name", "value", "unit"],
+            "tag": ["name"]
+        }
+        
+        node_type = next((k for k in required_fields.keys() if k in str(data)), None)
+        if node_type:
+            for field in required_fields[node_type]:
+                if field not in data or not data[field]:
+                    score *= 0.7
+        
+        return round(score, 2)
+
+    def _chunk_vector_text(self, data: Dict, source_url: Optional[str] = None) -> List[Dict]:
+        """Split content into semantically meaningful chunks for vector storage."""
+        chunks = []
+        timestamp = datetime.now().strftime("%Y-%m-%d")
+        
+        # Add semantic similarity threshold to metadata
+        similarity_threshold = 0.75  # Default threshold for semantic matching
+        
+        # Main concept chunk with enhanced metadata
+        concept_chunk = {
+            "text": f"""
+Concept: {data['concept']['name']}
+Description: {data['concept']['description']}
+Confidence Score: {data['concept'].get('confidence_score', 1.0)}
+""",
+            "type": "concept",
+            "metadata": {
+                "node_id": data["concept"]["id"],
+                "node_type": "Concept",
+                "source_url": source_url if source_url else "",
+                "timestamp": timestamp,
+                "confidence_score": data["concept"].get("confidence_score", 1.0),
+                "similarity_threshold": similarity_threshold
+            }
+        }
+        chunks.append(concept_chunk)
+
+        # Procedures chunk - one chunk per procedure with its steps
+        if data.get('procedures'):
+            for procedure in data['procedures']:
+                procedure_text = f"""
+Procedure: {procedure['title']}
+Summary: {procedure['summary']}
+Steps:
+{chr(10).join([f"{step['order']}. {step['text']}" for step in procedure.get('steps', [])])}
+"""
+                chunks.append({
+                    "text": procedure_text,
+                    "type": "procedure",
+                    "metadata": {
+                        "node_id": procedure["id"],
+                        "node_type": "Procedure",
+                        "source_url": source_url if source_url else "",
+                        "timestamp": timestamp,
+                        "parent_concept_id": data["concept"]["id"]
+                    }
+                })
+
+                # Individual step chunks for more granular search
+                for step in procedure.get('steps', []):
+                    step_text = f"""
+Step {step['order']} of Procedure: {procedure['title']}
+{step['text']}
+"""
+                    chunks.append({
+                        "text": step_text,
+                        "type": "step",
+                        "metadata": {
+                            "node_id": step["id"],
+                            "node_type": "Step",
+                            "source_url": source_url if source_url else "",
+                            "timestamp": timestamp,
+                            "parent_procedure_id": procedure["id"],
+                            "parent_concept_id": data["concept"]["id"],
+                            "order": step["order"]
+                        }
+                    })
+
+        # Metrics chunk
+        if data.get('metrics'):
+            metrics_text = "Metrics:\n" + "\n".join([
+                f"- {m['name']}: {m['value']} {m['unit']} ({m['timestamp']})"
+                for m in data.get('metrics', [])
+            ])
+            chunks.append({
+                "text": metrics_text,
+                "type": "metrics",
+                "metadata": {
+                    "node_id": data["concept"]["id"],
+                    "node_type": "Concept",
+                    "source_url": source_url if source_url else "",
+                    "timestamp": timestamp
+                }
+            })
+
+            # Individual metric chunks for more granular search
+            for metric in data.get('metrics', []):
+                metric_text = f"""
+Metric: {metric['name']}
+Value: {metric['value']} {metric['unit']}
+Timestamp: {metric['timestamp']}
+"""
+                chunks.append({
+                    "text": metric_text,
+                    "type": "metric",
+                    "metadata": {
+                        "node_id": metric["id"],
+                        "node_type": "Metric",
+                        "source_url": source_url if source_url else "",
+                        "timestamp": metric["timestamp"],
+                        "parent_concept_id": data["concept"]["id"]
+                    }
+                })
+
+        # Sources chunk
+        if data.get('sources') or source_url:
+            sources = data.get('sources', [])
+            if source_url:
+                sources.append({
+                    "url": source_url,
+                    "title": data["concept"]["name"],
+                    "published_at": timestamp
+                })
+            
+            sources_text = "Sources:\n" + "\n".join([
+                f"- {s['title']} ({s['url']}) - Published: {s.get('published_at', 'N/A')}"
+                for s in sources
+            ])
+            chunks.append({
+                "text": sources_text,
+                "type": "sources",
+                "metadata": {
+                    "node_id": data["concept"]["id"],
+                    "node_type": "Concept",
+                    "source_url": source_url if source_url else "",
+                    "timestamp": timestamp
+                }
+            })
+
+        # Tags chunk
+        if data.get('tags'):
+            tags_text = "Tags:\n" + "\n".join([
+                f"- {tag['name']}"
+                for tag in data.get('tags', [])
+            ])
+            chunks.append({
+                "text": tags_text,
+                "type": "tags",
+                "metadata": {
+                    "node_id": data["concept"]["id"],
+                    "node_type": "Concept",
+                    "source_url": source_url if source_url else "",
+                    "timestamp": timestamp
+                }
+            })
+
+        # Related concepts chunk
+        if data.get('related_concepts'):
+            concepts_text = "Related Concepts:\n" + "\n".join([
+                f"- {c['name']}: {c['description']}"
+                for c in data.get('related_concepts', [])
+            ])
+            chunks.append({
+                "text": concepts_text,
+                "type": "related_concepts",
+                "metadata": {
+                    "node_id": data["concept"]["id"],
+                    "node_type": "Concept",
+                    "source_url": source_url if source_url else "",
+                    "timestamp": timestamp
+                }
+            })
+
+        return chunks
+
+    def _normalize_data(self, data: Dict) -> Dict:
+        """Normalize the input data to ensure consistent structure and types."""
+        # Deep copy the input data to avoid modifying the original
+        normalized = data.copy()
+        
+        # Ensure concept exists with required fields
+        if "concept" not in normalized:
+            normalized["concept"] = {
+                "id": f"concept_{int(time.time())}",
+                "name": "",
+                "description": ""
+            }
+        else:
+            if "id" not in normalized["concept"]:
+                normalized["concept"]["id"] = f"concept_{int(time.time())}"
+            if "name" not in normalized["concept"]:
+                normalized["concept"]["name"] = ""
+            if "description" not in normalized["concept"]:
+                normalized["concept"]["description"] = ""
+        
+        # Ensure all list fields exist and contain proper objects
+        list_fields = {
+            "procedures": {
+                "id": lambda i: f"procedure_{int(time.time())}_{i}",
+                "title": "",
+                "summary": "",
+                "steps": []
+            },
+            "metrics": {
+                "id": lambda i: f"metric_{int(time.time())}_{i}",
+                "name": "",
+                "value": "",
+                "unit": "",
+                "timestamp": datetime.now().strftime("%Y-%m-%d")
+            },
+            "sources": {
+                "id": lambda i: f"source_{int(time.time())}_{i}",
+                "url": "",
+                "title": "",
+                "published_at": datetime.now().strftime("%Y-%m-%d")
+            },
+            "tags": {
+                "id": lambda i: f"tag_{int(time.time())}_{i}",
+                "name": ""
+            },
+            "related_concepts": {
+                "id": lambda i: f"concept_{int(time.time())}_{i}",
+                "name": "",
+                "description": ""
+            }
+        }
+        
+        for field, template in list_fields.items():
+            if field not in normalized:
+                normalized[field] = []
+            else:
+                # Ensure each item in the list has all required fields
+                for i, item in enumerate(normalized[field]):
+                    if not isinstance(item, dict):
+                        normalized[field][i] = {}
+                    for key, default_value in template.items():
+                        if key not in normalized[field][i]:
+                            normalized[field][i][key] = default_value(i) if callable(default_value) else default_value
+        
+        return normalized
+
+    async def _store_in_neo4j(self, data: Dict, source_url: Optional[str] = None):
+        """Store the extracted knowledge in Neo4j and vector DB"""
+        try:
+            # Validate and clean data before storage
+            data = self._validate_data_quality(data)
+            
+            # Create indexes if they don't exist
+            await self._ensure_indexes()
+            
+            # Normalize data before storage
+            data = self._normalize_data(data)
+            
+            # Create main Concept node
+            concept_props = {
+                "id": f"concept_{int(time.time())}",
+                "name": data["concept"]["name"],
+                "description": data["concept"]["description"]
+            }
+            concept_node = neo4j_connector.create_node("Concept", concept_props)
+            if not concept_node:
+                raise Exception("Failed to create concept node")
+
+            # Store in vector DB with chunked content
+            chunks = self._chunk_vector_text(data, source_url)
+            for chunk in chunks:
+                await vector_db.add_document(
+                    chunk["text"],
+                    metadata={
+                        **chunk["metadata"],
+                        "chunk_type": chunk["type"]
+                    },
+                    node_id=concept_node["id"],
+                    node_type="Concept",
+                    field_name="description"
+                )
+
+            # Handle Sources - Check for existing sources before creating new ones
+            sources_to_link = []
+            
+            # Handle URL source if provided
+            if source_url:
+                # Check if source with this URL already exists
+                existing_source = neo4j_connector.execute_query(
+                    "MATCH (s:Source) WHERE s.url = $url RETURN s",
+                    {"url": source_url}
+                )
+                
+                if existing_source and len(existing_source) > 0:
+                    # Use existing source
+                    source_node = existing_source[0]["s"]
+                    logger.info(f"Using existing source: {source_url}")
+                else:
+                    # Create new source
+                    source_props = {
+                        "id": f"source_{int(time.time())}",
+                        "url": source_url,
+                        "title": data["concept"]["name"],
+                        "published_at": data["sources"][0]["published_at"] if data.get("sources") else datetime.now().strftime("%Y-%m-%d")
+                    }
+                    source_node = neo4j_connector.create_node("Source", source_props)
+                    logger.info(f"Created new source: {source_url}")
+                
+                sources_to_link.append(source_node)
+
+            # Handle other sources from data
+            for source in data.get("sources", []):
+                if source.get("url"):
+                    # Check if source with this URL already exists
+                    existing_source = neo4j_connector.execute_query(
+                        "MATCH (s:Source) WHERE s.url = $url RETURN s",
+                        {"url": source["url"]}
+                    )
+                    
+                    if existing_source and len(existing_source) > 0:
+                        # Use existing source
+                        source_node = existing_source[0]["s"]
+                        logger.info(f"Using existing source: {source['url']}")
+                    else:
+                        # Create new source
+                        source_props = {
+                            "id": source["id"],
+                            "url": source["url"],
+                            "title": source["title"],
+                            "published_at": source["published_at"]
+                        }
+                        source_node = neo4j_connector.create_node("Source", source_props)
+                        logger.info(f"Created new source: {source['url']}")
+                    
+                    sources_to_link.append(source_node)
+
+            # Create relationships for all sources
+            for source_node in sources_to_link:
+                neo4j_connector.create_relationship(
+                    "Concept", "Source", "CITED_IN",
+                    concept_props, {"id": source_node["id"]}, {}
+                )
+
+            # Handle Tags - Check for existing tags before creating new ones
+            for tag in data.get("tags", []):
+                # First, try to find an existing tag with the same name
+                existing_tag = neo4j_connector.execute_query(
+                    "MATCH (t:Tag) WHERE t.name = $name RETURN t",
+                    {"name": tag["name"]}
+                )
+                
+                if existing_tag and len(existing_tag) > 0:
+                    # Use existing tag
+                    tag_node = existing_tag[0]["t"]
+                    logger.info(f"Using existing tag: {tag['name']}")
+                else:
+                    # Create new tag if it doesn't exist
+                    tag_props = {
+                        "id": tag["id"],
+                        "name": tag["name"]
+                    }
+                    tag_node = neo4j_connector.create_node("Tag", tag_props)
+                    logger.info(f"Created new tag: {tag['name']}")
+                
+                if tag_node:
+                    neo4j_connector.create_relationship(
+                        "Concept", "Tag", "TAGGED_AS",
+                        concept_props, {"id": tag_node["id"]}, {}
+                    )
+
+            # Create Procedure nodes for procedural parts
+            previous_proc = None
+            for i, procedure in enumerate(data.get("procedures", [])):
+                procedure_props = {
+                    "id": procedure["id"],
+                    "title": procedure["title"],
+                    "summary": procedure["summary"]
+                }
+                procedure_node = neo4j_connector.create_node("Procedure", procedure_props)
+                if procedure_node:
+                    # Link procedure to concept
+                    neo4j_connector.create_relationship(
+                        "Concept", "Procedure", "HAS_PROCEDURE",
+                        concept_props, procedure_props, {}
+                    )
+                    
+                    # Create Steps for each procedure
+                    for step in procedure.get("steps", []):
+                        step_props = {
+                            "id": step["id"],
+                            "order": step["order"],
+                            "text": step["text"]
+                        }
+                        step_node = neo4j_connector.create_node("Step", step_props)
+                        if step_node:
+                            neo4j_connector.create_relationship(
+                                "Procedure", "Step", "HAS_STEP",
+                                procedure_props, step_props, {}
+                            )
+                    
+                    # Link to previous procedure if exists
+                    if previous_proc:
+                        neo4j_connector.create_relationship(
+                            "Procedure", "Procedure", "RELATED_TO",
+                            previous_proc, procedure_props, {}
+                        )
+                    previous_proc = procedure_props
+
+            # Create Metric nodes for key facts
+            for i, metric in enumerate(data.get("metrics", [])):
+                metric_props = {
+                    "id": metric["id"],
+                    "name": metric["name"],
+                    "value": metric["value"],
+                    "unit": metric["unit"],
+                    "timestamp": metric["timestamp"]
+                }
+                metric_node = neo4j_connector.create_node("Metric", metric_props)
+                if metric_node:
+                    neo4j_connector.create_relationship(
+                        "Concept", "Metric", "MEASURED_BY",
+                        concept_props, metric_props, {}
+                    )
+
+            # Create related Concept nodes for informational parts
+            for concept in data.get("related_concepts", []):
+                # Check if related concept already exists
+                existing_concept = neo4j_connector.execute_query(
+                    "MATCH (c:Concept) WHERE c.name = $name RETURN c",
+                    {"name": concept["name"]}
+                )
+                
+                if existing_concept and len(existing_concept) > 0:
+                    # Use existing concept
+                    related_concept_node = existing_concept[0]["c"]
+                    logger.info(f"Using existing related concept: {concept['name']}")
+                else:
+                    # Create new concept if it doesn't exist
+                    related_concept_props = {
+                        "id": concept["id"],
+                        "name": concept["name"],
+                        "description": concept["description"]
+                    }
+                    related_concept_node = neo4j_connector.create_node("Concept", related_concept_props)
+                    logger.info(f"Created new related concept: {concept['name']}")
+                
+                if related_concept_node:
+                    neo4j_connector.create_relationship(
+                        "Concept", "Concept", "RELATED_TO",
+                        concept_props, {"id": related_concept_node["id"]}, {}
+                    )
+
+            return concept_node
+
+        except Exception as e:
+            logger.error(f"Error storing knowledge in Neo4j: {str(e)}")
+            raise
+
+    async def _ensure_indexes(self):
+        """Ensure all necessary indexes exist for optimal query performance."""
+        indexes = [
+            # Concept indexes
+            "CREATE INDEX concept_name IF NOT EXISTS FOR (c:Concept) ON (c.name)",
+            "CREATE INDEX concept_description IF NOT EXISTS FOR (c:Concept) ON (c.description)",
+            "CREATE FULLTEXT INDEX concept_text IF NOT EXISTS FOR (c:Concept) ON EACH [c.name, c.description]",
+            
+            # Procedure indexes
+            "CREATE INDEX procedure_title IF NOT EXISTS FOR (p:Procedure) ON (p.title)",
+            "CREATE FULLTEXT INDEX procedure_text IF NOT EXISTS FOR (p:Procedure) ON EACH [p.title, p.summary]",
+            
+            # Step indexes
+            "CREATE INDEX step_order IF NOT EXISTS FOR (s:Step) ON (s.order)",
+            "CREATE FULLTEXT INDEX step_text IF NOT EXISTS FOR (s:Step) ON EACH [s.text]",
+            
+            # Metric indexes
+            "CREATE INDEX metric_name IF NOT EXISTS FOR (m:Metric) ON (m.name)",
+            "CREATE INDEX metric_timestamp IF NOT EXISTS FOR (m:Metric) ON (m.timestamp)",
+            
+            # Tag indexes
+            "CREATE INDEX tag_name IF NOT EXISTS FOR (t:Tag) ON (t.name)",
+            
+            # Source indexes
+            "CREATE INDEX source_url IF NOT EXISTS FOR (s:Source) ON (s.url)",
+            "CREATE INDEX source_published_at IF NOT EXISTS FOR (s:Source) ON (s.published_at)"
+        ]
+        
+        for index in indexes:
+            try:
+                neo4j_connector.execute_query(index)
+            except Exception as e:
+                logger.warning(f"Failed to create index: {str(e)}")
+
+    async def search_similar_concepts(self, query: str, threshold: float = 0.75, limit: int = 10) -> List[Dict]:
+        """Search for similar concepts using semantic similarity."""
+        try:
+            # Get vector representation of the query
+            query_vector = await vector_db.get_embedding(query)
+            
+            # Search in vector store with threshold
+            results = await vector_db.search(
+                query_vector,
+                threshold=threshold,
+                limit=limit,
+                filter={"node_type": "Concept"}
+            )
+            
+            # Enhance results with additional context
+            enhanced_results = []
+            for result in results:
+                # Get related nodes
+                related_nodes = neo4j_connector.execute_query(
+                    """
+                    MATCH (c:Concept {id: $id})
+                    OPTIONAL MATCH (c)-[:HAS_PROCEDURE]->(p:Procedure)
+                    OPTIONAL MATCH (c)-[:MEASURED_BY]->(m:Metric)
+                    OPTIONAL MATCH (c)-[:TAGGED_AS]->(t:Tag)
+                    RETURN c, collect(distinct p) as procedures, 
+                           collect(distinct m) as metrics,
+                           collect(distinct t) as tags
+                    """,
+                    {"id": result["node_id"]}
+                )
+                
+                if related_nodes:
+                    node_data = related_nodes[0]
+                    enhanced_results.append({
+                        "concept": node_data["c"],
+                        "procedures": node_data["procedures"],
+                        "metrics": node_data["metrics"],
+                        "tags": node_data["tags"],
+                        "similarity_score": result["similarity_score"]
+                    })
+            
+            return enhanced_results
+            
+        except Exception as e:
+            logger.error(f"Error in semantic search: {str(e)}")
             raise 

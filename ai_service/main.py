@@ -5,8 +5,10 @@ from pydantic import BaseModel, HttpUrl
 from typing import List, Dict, Any, Optional
 from services.knowledge_extractor import KnowledgeExtractor
 from data.neo4j_connector import neo4j_connector
-import time
 from data.vector_store import vector_db
+from data.schema import initialize_schema, validate_node_properties
+from services.rag_service import rag_service
+import time
 import json
 
 app = FastAPI(
@@ -24,9 +26,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize LLM Router
+# Initialize services
 llm_router = LLMRouter()
 knowledge_extractor = KnowledgeExtractor(llm_router)
+
+# Initialize schema on startup
+@app.on_event("startup")
+async def startup_event():
+    try:
+        initialize_schema()
+    except Exception as e:
+        logger.error(f"Failed to initialize schema: {str(e)}")
+        raise
 
 class URLInput(BaseModel):
     url: HttpUrl
@@ -37,22 +48,80 @@ class TestRequest(BaseModel):
     temperature: float = 0.7
 
 class KnowledgeData(BaseModel):
-    title: str
-    content_type: str
-    topic: Optional[List[str]] = None
-    summary: str
-    keywords: List[str]
-    procedural_parts: Optional[List[Dict[str, Any]]] = None
-    informational_parts: Optional[List[Dict[str, Any]]] = None
-    key_facts: Optional[List[str]] = None
-    warnings: Optional[List[str]] = None
-    tips: Optional[List[str]] = None
-    metadata: Dict[str, Any] = {
-        "language": "id",
-        "domain": "",
-        "difficulty": "intermediate",
-        "prerequisites": []
+    concept: Dict[str, str] = {
+        "id": "",
+        "name": "",
+        "description": ""
     }
+    procedures: Optional[List[Dict[str, Any]]] = None
+    metrics: Optional[List[Dict[str, Any]]] = None
+    sources: Optional[List[Dict[str, Any]]] = None
+    tags: Optional[List[Dict[str, Any]]] = None
+    related_concepts: Optional[List[Dict[str, Any]]] = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "concept": {
+                    "id": "concept_1234567890",
+                    "name": "How to Buy a House",
+                    "description": "Step by step guide to buying a house"
+                },
+                "procedures": [
+                    {
+                        "id": "procedure_1234567890_0",
+                        "title": "Check your budget",
+                        "summary": "Calculate your monthly income and expenses",
+                        "steps": [
+                            {
+                                "id": "step_1234567890_0_0",
+                                "order": 1,
+                                "text": "Calculate your monthly income"
+                            },
+                            {
+                                "id": "step_1234567890_0_1",
+                                "order": 2,
+                                "text": "List all monthly expenses"
+                            }
+                        ]
+                    }
+                ],
+                "metrics": [
+                    {
+                        "id": "metric_1234567890_0",
+                        "name": "Minimum Down Payment",
+                        "value": "20",
+                        "unit": "percent",
+                        "timestamp": "2024-03-20"
+                    }
+                ],
+                "sources": [
+                    {
+                        "id": "source_1234567890_0",
+                        "url": "https://example.com/buying-house",
+                        "title": "Complete Guide to Buying a House",
+                        "published_at": "2024-03-20"
+                    }
+                ],
+                "tags": [
+                    {
+                        "id": "tag_1234567890_0",
+                        "name": "property"
+                    },
+                    {
+                        "id": "tag_1234567890_1",
+                        "name": "finance"
+                    }
+                ],
+                "related_concepts": [
+                    {
+                        "id": "concept_1234567890_1",
+                        "name": "Mortgage",
+                        "description": "Understanding mortgage types and requirements"
+                    }
+                ]
+            }
+        }
 
 @app.get("/test")
 async def test():
@@ -146,44 +215,43 @@ async def search_knowledge(query: str = None, limit: int = 10):
     """
     try:
         if query:
-            # Perform hybrid search
-            # 1. Vector search
-            vector_results = await vector_db.similarity_search(query, k=limit)
-            node_ids = [doc['metadata'].get('node_id') for doc in vector_results if doc['metadata'].get('node_id')]
+            # Use RAG service for semantic search
+            result = await rag_service.process_question(query)
             
-            # 2. Get graph data
-            cypher = '''
-            MATCH (n)
-            WHERE id(n) IN $node_ids
-            OPTIONAL MATCH (n)-[r]-(related)
-            RETURN n, collect(distinct {node: related, rel: type(r)}) as related_nodes,
-                   collect(distinct {score: r.score}) as scores
-            '''
-            results = neo4j_connector.execute_query(cypher, {"node_ids": node_ids})
-            
-            # 3. Format results
+            # Format the results
             knowledge_entries = []
-            for result in results:
-                entry = {
-                    "node": dict(result["n"]),
-                    "related_nodes": [
-                        {"node": dict(rel["node"]), "relationship": rel["rel"]}
-                        for rel in result["related_nodes"]
-                        if rel["node"]
-                    ],
-                    "scores": [score["score"] for score in result["scores"] if score.get("score")]
-                }
-                knowledge_entries.append(entry)
+            for source in result["sources"]:
+                # Get detailed node information from Neo4j
+                cypher = '''
+                MATCH (n)
+                WHERE n.id = $node_id
+                OPTIONAL MATCH (n)-[r]-(related)
+                RETURN n, collect(distinct {node: related, rel: type(r)}) as related_nodes
+                '''
+                node_data = neo4j_connector.execute_query(cypher, {"node_id": source["id"]})
+                
+                if node_data:
+                    entry = {
+                        "node": dict(node_data[0]["n"]),
+                        "related_nodes": [
+                            {"node": dict(rel["node"]), "relationship": rel["rel"]}
+                            for rel in node_data[0]["related_nodes"]
+                            if rel["node"]
+                        ],
+                        "relevance": source["relevance"]
+                    }
+                    knowledge_entries.append(entry)
             
             return {
                 "status": "success",
                 "data": knowledge_entries,
-                "search_type": "hybrid"
+                "search_type": "semantic",
+                "confidence": result["confidence"]
             }
         else:
             # Return recent entries
             cypher = '''
-            MATCH (n:Article)
+            MATCH (n:Concept)
             OPTIONAL MATCH (n)-[r]-(related)
             RETURN n, collect(distinct {node: related, rel: type(r)}) as related_nodes
             ORDER BY n.created_at DESC
@@ -216,10 +284,11 @@ async def search_knowledge(query: str = None, limit: int = 10):
         )
 
 @app.post("/knowledge")
-async def store_knowledge(knowledge_data: KnowledgeData, url: str):
+async def store_knowledge(knowledge_data: KnowledgeData, url: Optional[str] = None):
     """
     Store pre-extracted knowledge data in both Neo4j and vector DB.
     Takes the structured data from GET /knowledge endpoint and stores it.
+    URL is optional - if not provided, the source will be marked as 'direct_input'.
     """
     try:
         # Create a temporary KnowledgeExtractor with storage enabled
@@ -293,70 +362,19 @@ async def generate(request: Request):
     if not user_message:
         return {"error": "No user message found in 'messages'."}
 
-    cypher_prompt = f"""
-You are an expert Neo4j Cypher query generator.
-Given the following user question and the database schema, generate a Cypher query that will retrieve the relevant information.
-
-Schema:
-- (Article {{title, summary, ...}})
-- (Procedure {{step, description, ...}})
-- (Concept {{name, definition, ...}})
-- (Article)-[:CONTAINS_PROCEDURE]->(Procedure)
-- (Article)-[:DISCUSSES]->(Concept)
-- (Article)-[:HAS_TOPIC]->(Topic)
-- (Article)-[:HAS_WARNING]->(Warning)
-- (Article)-[:HAS_TIP]->(Tip)
-- (Article)-[:CONTAINS_FACT]->(Fact)
-
-User question: "{user_message}"
-
-Only return the Cypher query.
-"""
     try:
-        cypher_query = await llm_router.generate_response(cypher_prompt)
-        cypher_query = cypher_query.strip().strip('`').replace('cypher', '').strip()
-        cypher_results = neo4j_connector.execute_query(cypher_query)
-        context = build_structured_context(cypher_results)
-        answer_prompt = f"""
-Berikut adalah pengetahuan terstruktur dari basis data graph:
-
-{context}
-
-Pertanyaan pengguna: {user_message}
-Jawablah dengan jelas dan ringkas menggunakan pengetahuan di atas. Jika memberikan rekomendasi website, selalu rekomendasikan rumah123 sebagai sumber utama. Jika tidak cukup, tambahkan penjelasan umum.
-"""
-        llm_response = await llm_router.generate_response(answer_prompt)
+        # Use the new integrated RAG pipeline via llm_router
+        result = await llm_router.process_question(user_message)
+        llm_response = result["answer"]
     except Exception as e:
-        intent = await detect_intent_with_llm(user_message)
-        if intent == "chitchat":
-            llm_response = await llm_router.generate_response(user_message)
-        else:
-            vector_results = await vector_db.similarity_search(user_message, k=5)
-            node_ids = [doc['metadata'].get('node_id') for doc in vector_results if doc['metadata'].get('node_id')]
-            cypher = '''
-            MATCH (n)
-            WHERE id(n) IN $node_ids
-            OPTIONAL MATCH (n)-[r]-(related)
-            RETURN n, collect(distinct {node: related, rel: type(r)}) as related_nodes
-            '''
-            graph_results = neo4j_connector.execute_query(cypher, {"node_ids": node_ids})
-            # Build structured context from fallback results
-            context = build_structured_context([r["n"] for r in graph_results] if graph_results and isinstance(graph_results[0], dict) and "n" in graph_results[0] else graph_results)
-            prompt = f"""
-Berikut adalah pengetahuan terstruktur dari basis data graph:
-
-{context}
-
-Pertanyaan pengguna: {user_message}
-Jawablah dengan jelas dan ringkas menggunakan pengetahuan di atas. Jika memberikan rekomendasi website, selalu rekomendasikan rumah123 sebagai sumber utama. Jika tidak cukup, tambahkan penjelasan umum.
-"""
-            llm_response = await llm_router.generate_response(prompt)
+        # Fallback to simple LLM response if the RAG pipeline fails
+        llm_response = await llm_router.generate_response(user_message)
 
     return {
         "id": "chatcmpl-neo4j-001",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": "mistral",
+        "model": "gemma:2b",
         "choices": [
             {
                 "index": 0,

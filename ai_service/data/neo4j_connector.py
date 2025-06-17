@@ -63,13 +63,7 @@ class Neo4jConnector:
     def create_node(self, label: str, properties: Dict[str, Any]) -> Dict[str, Any]:
         """
         Create a new node with the given label and properties.
-        
-        Args:
-            label (str): Node label
-            properties (Dict[str, Any]): Node properties
-            
-        Returns:
-            Dict[str, Any]: Created node data
+        Returns a dict with 'id' and all node properties.
         """
         query = f"""
         CREATE (n:{label})
@@ -77,7 +71,11 @@ class Neo4jConnector:
         RETURN n
         """
         result = self.execute_query(query, {"properties": properties})
-        return result[0] if result else {}
+        if result and 'n' in result[0]:
+            node = result[0]['n']
+            # node is a neo4j.Node object; extract id and properties
+            return {"id": node.id, **dict(node)}
+        return {}
 
     def create_relationship(
         self,
